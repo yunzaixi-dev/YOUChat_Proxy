@@ -35,6 +35,8 @@ const availableModels = [
     "gpt_4o",
     "gpt_4_turbo",
     "gpt_4",
+    "claude_4_opus",
+    "claude_4_opus_thinking",
     "claude_4_sonnet",
     "claude_4_sonnet_thinking",
     "gemini_2_5_pro_experimental",
