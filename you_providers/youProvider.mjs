@@ -105,7 +105,8 @@ class YouProvider {
                 this.sessionManager.setSessions(this.sessions);
             } else {
                 console.error(`未能获取有效的登录 cookie`);
-                await browserInstance.browser.close();
+                // 不要关闭浏览器实例，保持可用状态供后续使用
+                console.warn(`保持浏览器实例 ${browserInstance.id} 运行状态，可稍后重试登录`);
             }
         } else {
             // 使用配置文件中的 cookie
@@ -750,21 +751,39 @@ class YouProvider {
         await sleep(2000);
         try {
             if (page.isClosed()) {
-                console.warn(`[${username}] 页面关闭，重新创建...`);
+                console.warn(`[${username}] 页面已关闭，尝试从浏览器实例恢复...`);
+                // 尝试从browserInstance恢复页面
+                if (browserInstance && browserInstance.browser && browserInstance.browser.isConnected()) {
+                    page = await browserInstance.browser.newPage();
+                    browserInstance.page = page; // 更新页面引用
+                    console.log(`[${username}] 成功从浏览器实例创建新页面`);
+                } else {
+                    throw new Error(`浏览器实例不可用，无法恢复页面`);
+                }
             }
-            await page.goto("https://you.com", {waitUntil: 'domcontentloaded'});
+            await page.goto("https://you.com", { 
+                waitUntil: 'domcontentloaded', 
+                timeout: 30000 
+            });
         } catch (err) {
-            if (/detached frame/i.test(err.message)) {
-                console.warn(`[${username}] 检测到页面 Frame 分离。`);
+            if (/detached frame/i.test(err.message) || /Target closed/i.test(err.message)) {
+                console.warn(`[${username}] 检测到页面连接断开，尝试恢复...`);
                 try {
-                    console.warn(`[${username}] 重试"https://you.com"...`);
-                    if (!page.isClosed()) {
-                        await page.goto("https://you.com", {waitUntil: 'domcontentloaded'});
+                    // 尝试从浏览器实例恢复
+                    if (browserInstance && browserInstance.browser && browserInstance.browser.isConnected()) {
+                        console.warn(`[${username}] 重新创建页面...`);
+                        page = await browserInstance.browser.newPage();
+                        browserInstance.page = page; // 更新页面引用
+                        await page.goto("https://you.com", { 
+                            waitUntil: 'domcontentloaded', 
+                            timeout: 30000 
+                        });
+                        console.log(`[${username}] 页面恢复成功`);
                     } else {
-                        console.error(`[${username}] 页面被彻底关闭。`);
+                        throw new Error(`浏览器实例连接断开，无法恢复`);
                     }
                 } catch (retryErr) {
-                    console.error(`[${username}] 重试 page.goto 失败:`, retryErr);
+                    console.error(`[${username}] 页面恢复失败:`, retryErr);
                     throw retryErr;
                 }
             } else {

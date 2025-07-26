@@ -43,6 +43,12 @@ class SessionManager {
         this.sessionAutoUnlockTimers = {}; // 自动解锁计时器
         this.cooldownList = this.loadCooldownList(); // 加载并清理 cooldown 文件
         this.cleanupCooldownList();
+        this.isDockerEnvironment = process.env.DOCKER_ENV === 'true' || fs.existsSync('/.dockerenv');
+        
+        // Docker环境下启用浏览器实例回收机制
+        if (this.isDockerEnvironment) {
+            this.setupBrowserInstanceRecycling();
+        }
     }
 
     setSessions(sessions) {
@@ -222,9 +228,20 @@ class SessionManager {
                         '--disable-setuid-sandbox',
                         '--disable-gpu',
                         '--disable-dev-shm-usage',
+                        '--disable-web-security',
+                        '--disable-features=VizDisplayCompositor',
+                        '--disable-background-timer-throttling',
+                        '--disable-backgrounding-occluded-windows',
+                        '--disable-renderer-backgrounding',
+                        '--disable-field-trial-config',
+                        '--disable-background-networking',
+                        '--no-first-run',
+                        '--no-default-browser-check',
                         '--remote-debugging-port=0',
                         '--window-size=1280,850',
                         '--force-device-scale-factor=1',
+                        '--memory-pressure-off',
+                        '--max_old_space_size=4096',
                     ],
                 });
                 page = await browser.newPage();
@@ -308,10 +325,34 @@ class SessionManager {
                 const index = (this.browserIndex + i) % totalBrowsers;
                 const browserInstance = this.browserInstances[index];
 
+                // 检查浏览器连接状态，如果断开则尝试重新连接
                 if (!browserInstance.locked) {
-                    browserInstance.locked = true;
-                    this.browserIndex = (index + 1) % totalBrowsers;
-                    return browserInstance;
+                    try {
+                        // 检查浏览器是否仍然连接
+                        if (browserInstance.browser.isConnected && browserInstance.browser.isConnected()) {
+                            // 检查页面是否仍然可用
+                            if (!browserInstance.page.isClosed()) {
+                                browserInstance.locked = true;
+                                this.browserIndex = (index + 1) % totalBrowsers;
+                                return browserInstance;
+                            }
+                        }
+                        
+                        // 浏览器断开连接，尝试重新创建页面
+                        console.warn(`浏览器实例 ${browserInstance.id} 连接已断开，尝试恢复...`);
+                        await this.recoverBrowserInstance(browserInstance);
+                        
+                        browserInstance.locked = true;
+                        this.browserIndex = (index + 1) % totalBrowsers;
+                        return browserInstance;
+                    } catch (error) {
+                        console.error(`检查浏览器实例 ${browserInstance.id} 状态失败:`, error);
+                        // 如果检查失败，尝试重新创建
+                        await this.recoverBrowserInstance(browserInstance);
+                        browserInstance.locked = true;
+                        this.browserIndex = (index + 1) % totalBrowsers;
+                        return browserInstance;
+                    }
                 }
             }
             throw new Error('当前负载已饱和，请稍后再试(以达到最大并发)');
@@ -322,6 +363,23 @@ class SessionManager {
         await this.browserMutex.runExclusive(async () => {
             const browserInstance = this.browserInstances.find(b => b.id === browserId);
             if (browserInstance) {
+                // 清理页面状态但保持浏览器实例运行
+                try {
+                    if (!browserInstance.page.isClosed()) {
+                        // 清理页面状态，但不关闭页面
+                        await browserInstance.page.evaluate(() => {
+                            // 清理本地存储和会话存储
+                            if (typeof localStorage !== 'undefined') {
+                                localStorage.clear();
+                            }
+                            if (typeof sessionStorage !== 'undefined') {
+                                sessionStorage.clear();
+                            }
+                        });
+                    }
+                } catch (error) {
+                    console.warn(`清理浏览器实例 ${browserId} 状态时出错:`, error);
+                }
                 browserInstance.locked = false;
             }
         });
@@ -447,21 +505,120 @@ class SessionManager {
         if (this.sessionAutoUnlockTimers[username]) {
             clearTimeout(this.sessionAutoUnlockTimers[username]);
         }
+        
+        // 如果超时时间为0，不启动计时器（永不超时）
+        if (SESSION_LOCK_TIMEOUT === 0) {
+            return;
+        }
+        
         const lockDurationMs = SESSION_LOCK_TIMEOUT * 1000;
 
         this.sessionAutoUnlockTimers[username] = setTimeout(async () => {
             const session = this.sessions[username];
             if (session && session.locked) {
                 console.warn(
-                    `会话 "${username}" 已自动解锁`
+                    `会话 "${username}" 已自动解锁（超时${SESSION_LOCK_TIMEOUT}秒）`
                 );
 
                 await session.mutex.runExclusive(async () => {
                     session.locked = false;
                 });
 
+                // 释放关联的浏览器，但不关闭浏览器实例
+                if (browserId) {
+                    await this.releaseBrowser(browserId);
+                }
             }
         }, lockDurationMs);
+    }
+
+    async recoverBrowserInstance(browserInstance) {
+        try {
+            console.log(`开始恢复浏览器实例 ${browserInstance.id}...`);
+            
+            // 如果浏览器进程仍然存在但页面关闭，创建新页面
+            if (browserInstance.browser && browserInstance.browser.isConnected && browserInstance.browser.isConnected()) {
+                if (browserInstance.page.isClosed()) {
+                    console.log(`为浏览器实例 ${browserInstance.id} 创建新页面...`);
+                    browserInstance.page = await browserInstance.browser.newPage();
+                    
+                    // 重新应用指纹和显示优化
+                    if (browserInstance.fingerprint) {
+                        const browserType = browserInstance.isEdgeBrowser ? 'edge' : 'chrome';
+                        await setupBrowserFingerprint(browserInstance.page, browserType);
+                    }
+                    
+                    await optimizeBrowserDisplay(browserInstance.page, {
+                        width: 1280,
+                        height: 850,
+                        deviceScaleFactor: 1,
+                        cssScale: 1,
+                        fixHighDpi: true,
+                        isHeadless: this.isHeadless
+                    });
+                }
+            } else {
+                // 浏览器进程已断开，需要完全重新启动
+                console.log(`浏览器实例 ${browserInstance.id} 进程已断开，重新启动...`);
+                
+                const browserPath = detectBrowser(process.env.BROWSER_TYPE || 'auto');
+                const sharedProfilePath = path.join(__dirname, 'browser_profiles');
+                const userDataDir = path.join(sharedProfilePath, browserInstance.id);
+                
+                // 重新启动浏览器
+                const newInstance = await this.launchSingleBrowser(browserInstance.id, userDataDir, browserPath);
+                
+                // 更新现有实例的引用
+                browserInstance.browser = newInstance.browser;
+                browserInstance.page = newInstance.page;
+                browserInstance.fingerprint = newInstance.fingerprint;
+                browserInstance.isEdgeBrowser = newInstance.isEdgeBrowser;
+            }
+            
+            console.log(`浏览器实例 ${browserInstance.id} 恢复成功`);
+        } catch (error) {
+            console.error(`恢复浏览器实例 ${browserInstance.id} 失败:`, error);
+            throw error;
+        }
+    }
+
+    setupBrowserInstanceRecycling() {
+        console.log('Docker环境检测到，启用浏览器实例回收机制');
+        
+        // 每10分钟检查一次浏览器实例状态
+        setInterval(async () => {
+            await this.recycleBrowserInstances();
+        }, 10 * 60 * 1000);
+    }
+
+    async recycleBrowserInstances() {
+        console.log('开始回收浏览器实例...');
+        
+        for (const browserInstance of this.browserInstances) {
+            if (!browserInstance.locked) {
+                try {
+                    // 检查浏览器是否还在运行
+                    if (browserInstance.browser && browserInstance.browser.isConnected && browserInstance.browser.isConnected()) {
+                        // 浏览器还在运行，检查页面状态
+                        if (browserInstance.page && !browserInstance.page.isClosed()) {
+                            // 清理页面缓存和状态但保持页面打开
+                            await browserInstance.page.evaluate(() => {
+                                if (typeof localStorage !== 'undefined') {
+                                    localStorage.clear();
+                                }
+                                if (typeof sessionStorage !== 'undefined') {
+                                    sessionStorage.clear();
+                                }
+                            });
+                        }
+                    }
+                } catch (error) {
+                    console.warn(`回收浏览器实例 ${browserInstance.id} 时出错:`, error);
+                }
+            }
+        }
+        
+        console.log('浏览器实例回收完成');
     }
 
     async releaseSession(username, browserId) {
